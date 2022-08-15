@@ -12,6 +12,10 @@ Implementing environment:
 
 
 ## Training
+- **RGCN**
+```bash
+python gnn.py --model rgcn --dataset DGraphFin --epochs 400 --runs 10 --device 1 --MV_trick=‘null’ --BN_trick='hetro' --BN_ratio 1.0
+```
 
 - **MLP**
 ```bash
