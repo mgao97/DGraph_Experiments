@@ -22,17 +22,19 @@ def read_dgraphfin(folder):
 
     x = torch.tensor(x, dtype=torch.float).contiguous()
     y = torch.tensor(y, dtype=torch.int64)
+    edge_index_tensor = torch.tensor(edge_index).long().T
     edge_index = torch.tensor(edge_index.transpose(), dtype=torch.int64).contiguous()
     edge_type = torch.tensor(edge_type, dtype=torch.float)
     train_mask = torch.tensor(train_mask, dtype=torch.int64)
     valid_mask = torch.tensor(valid_mask, dtype=torch.int64)
     test_mask = torch.tensor(test_mask, dtype=torch.int64)
 
-    data = Data(x=x, edge_index=edge_index, edge_attr=edge_type, y=y)
+    data = Data(x=x, edge_index=edge_index_tensor, edge_attr=edge_type, y=y)
     data.train_mask = train_mask
     data.valid_mask = valid_mask
     data.test_mask = test_mask
-
+    #data.edge_index = edge_index_tensor
+    print(data.edge_index)
     return data
 
 class DGraphFin(InMemoryDataset):
