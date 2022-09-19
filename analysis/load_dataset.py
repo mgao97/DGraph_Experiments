@@ -4,7 +4,7 @@ import torch_geometric as tg
 
 datapath = '../dataset/DGraphFin/raw/dgraphfin.npz'
 
-def build_tg_data(is_undirected=True):
+def build_tg_data(is_undirected=True,datapath=None):
     origin_data = np.load(datapath)
     data = tg.data.Data()
     data.x = torch.tensor(origin_data['x']).float()
