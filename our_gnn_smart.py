@@ -6,7 +6,7 @@ from utils.evaluator import Evaluator
 from utils.tricks import Missvalues
 from utils.tricks import Background
 from utils.tricks import Structure
-from models import MLP, MLPLinear, GCN, SAGE, GAT, GATv2,RGCN
+from models import MLP, MLPLinear, GCN, SAGE, GAT, GATv2,RGCN, SMART
 from logger import Logger
 
 import argparse
@@ -49,13 +49,14 @@ sage_parameters = {'lr':0.01
               , 'l2':5e-7
              }
 
-gat_parameters = {'lr':0.01
+gcn_smart_parameters = {'lr':0.01
               , 'num_layers':2
               , 'hidden_channels':64
               , 'dropout':0
+              , 'simi_threshold':0.5
               , 'batchnorm': False
               , 'l2':5e-7
-             }
+}
 
 def train(model, data, train_idx, optimizer, weight=None, no_conv=False,is_rgcn=False):
     # data.y is labels of shape (N, ) 
@@ -90,6 +91,7 @@ def test(model, data, split_idx, evaluator, no_conv=False,is_rgcn=True):
             out = model(data.x, data.edge_index)
         
     y_pred = out.exp()  # (N,num_classes)
+    # print(y_pred)
     
     losses, eval_results = dict(), dict()
     for key in ['train', 'valid', 'test']:
@@ -105,10 +107,10 @@ def main():
     parser.add_argument('--device', type=int, default=0)
     parser.add_argument('--dataset', type=str, default='DGraphFin')
     parser.add_argument('--log_steps', type=int, default=10)
-    parser.add_argument('--model', type=str, default='mlp')
+    parser.add_argument('--model', type=str, default='gcn_smart')
     parser.add_argument('--use_embeddings', action='store_true')
-    parser.add_argument('--epochs', type=int, default=1000)
-    parser.add_argument('--runs', type=int, default=5)
+    parser.add_argument('--epochs', type=int, default=400)
+    parser.add_argument('--runs', type=int, default=1)
     parser.add_argument('--fold', type=int, default=0)
     parser.add_argument('--MV_trick', type=str, default='null')
     parser.add_argument('--BN_trick', type=str, default='null')
@@ -196,16 +198,16 @@ def main():
         model_para.pop('lr')
         model_para.pop('l2')        
         model = SAGE(in_channels = data.x.size(-1), out_channels = nlabels, **model_para).to(device)
-    if args.model == 'gat':        
-        para_dict = gat_parameters
-        model_para = gat_parameters.copy()
-        model_para.pop('lr')
-        model_para.pop('l2')        
-        model = GAT(in_channels = data.x.size(-1), out_channels = nlabels, **model_para).to(device)
     if args.model == 'rgcn':   
         para_dict = gcn_parameters
         model = RGCN(data.x.size(-1),16,2,4).to(device)
         is_rgcn=True
+    if args.model == 'gcn_smart':
+        para_dict = gcn_smart_parameters
+        model_para = gcn_smart_parameters.copy()
+        model_para.pop('lr')
+        model_para.pop('l2')  
+        model = SMART(data.x.size(-1), hidden_dim = 64, output_dim = nlabels, dropout=0, similarity_threshold=0.5, num_layers=2).to(device)
     print(f'Model {args.model} initialized')
 
     evaluator = Evaluator(eval_metric)
@@ -217,7 +219,7 @@ def main():
         gc.collect()
         print(sum(p.numel() for p in model.parameters()))
 
-        model.reset_parameters()
+        # model.reset_parameters()
         optimizer = torch.optim.Adam(model.parameters(), lr=para_dict['lr'], weight_decay=para_dict['l2'])
         best_valid = 0
         min_valid_loss = 1e8
@@ -267,7 +269,7 @@ def main():
     final_results = logger.print_statistics()
     print('final_results:', final_results)
     para_dict.update(final_results)
-    pd.DataFrame(para_dict, index=[args.model]).to_csv(result_dir+'/results.csv')
+    pd.DataFrame(para_dict, index=[args.model]).to_csv(result_dir+'/smart_results.csv')
 
 
 if __name__ == "__main__":
