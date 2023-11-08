@@ -5,3 +5,5 @@ from .sage_neighsampler import SAGE_NeighSampler
 from .gat import GAT, GATv2
 from .gat_neighsampler import GAT_NeighSampler, GATv2_NeighSampler
 from .rgcn import RGCN
+# from .gcnii import GCNII
+from .gcn_smart import SMART

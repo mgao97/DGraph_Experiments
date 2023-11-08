@@ -1,5 +1,6 @@
 # dataset name: DGraphFin
-
+from __future__ import division
+from __future__ import print_function
 # from utils import DGraphFin
 from torch_geometric.datasets import Planetoid
 from utils.utils import prepare_folder
@@ -25,313 +26,178 @@ from torch_geometric.utils import to_undirected
 import pandas as pd
 import numpy as np
 import time
+
+
+import argparse
+import numpy as np
+import scipy.sparse as sp
+import torch
+import sys
+import copy
+import random
+import torch.nn.functional as F
+import torch.optim as optim
+import cvae_pretrain
+
+from utils.utils import load_data, accuracy, normalize_adj, normalize_features, sparse_mx_to_torch_sparse_tensor
+from gcn.models import LAGCN
+from tqdm import trange
+
+exc_path = sys.path[0]
+
 eval_metric = 'auc'
 
-mlp_parameters = {'lr':0.01
-              , 'num_layers':2
-              , 'hidden_channels':64
-              , 'dropout':0.0
-              , 'batchnorm': False
-              , 'l2':5e-7
-             }
+parser = argparse.ArgumentParser()
+parser.add_argument("--samples", type=int, default=4)
+parser.add_argument("--concat", type=int, default=4)
+parser.add_argument('--runs', type=int, default=5, help='The number of experiments.')
 
-gcn_parameters = {'lr':0.01
-              , 'num_layers':2
-              , 'hidden_channels':64
-              , 'dropout':0.0
-              , 'batchnorm': False
-              , 'l2':5e-7
-             }
+parser.add_argument('--dataset', default='cora', help='Dataset string.')
+parser.add_argument('--seed', type=int, default=42, help='Random seed.')
+parser.add_argument('--epochs', type=int, default=200, help='Number of epochs to train.')
+parser.add_argument('--lr', type=float, default=0.01, help='Initial learning rate.')
+parser.add_argument('--weight_decay', type=float, default=5e-4, help='Weight decay (L2 loss on parameters).')
+parser.add_argument('--hidden', type=int, default=64, help='Number of hidden units.')
+parser.add_argument('--dropout', type=float, default=0.5, help='Dropout rate (1 - keep probability).')
 
-sage_parameters = {'lr':0.01
-              , 'num_layers':2
-              , 'hidden_channels':64
-              , 'dropout':0
-              , 'batchnorm': False
-              , 'l2':5e-7
-             }
+parser.add_argument('--tem', type=float, default=0.5, help='Sharpening temperature')
+parser.add_argument('--lam', type=float, default=1., help='Lamda')
 
-gcn_smart_parameters = {'lr':0.01
-              , 'num_layers':2
-              , 'hidden_channels':64
-              , 'dropout':0
-              , 'simi_threshold':0.5
-              , 'batchnorm': False
-              , 'l2':5e-7
-}
+args = parser.parse_args()
 
-gat_neighsampler_parameters = {'lr':0.003
-              , 'num_layers':2
-              , 'hidden_channels':128
-              , 'dropout':0.0
-              , 'batchnorm': False
-              , 'l2':5e-7
-             , 'layer_heads':[4,1]
-             }
+torch.manual_seed(args.seed)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed(args.seed)
+np.random.seed(args.seed)
+random.seed(args.seed)
 
-def train(model, data, train_idx, optimizer, no_conv=False,is_rgcn=False):
-    # data.y is labels of shape (N, ) 
-    model.train()
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+args.cuda = torch.cuda.is_available()
 
-    optimizer.zero_grad()
-    if no_conv:
-        out = model(data.x[train_idx])
-    else:
-        if(is_rgcn):
-            out = model(data.x, data.edge_index, data.edge_type)[train_idx]
-        else:
-            out = model(data.x, data.edge_index)[train_idx]
-    loss = F.cross_entropy(out, data.y[train_idx])
-    loss.backward()
-    optimizer.step()
-
-    return loss.item()
-
-
-@torch.no_grad()
-def test(model, data, split_idx, evaluator, no_conv=False,is_rgcn=True):
-    # data.y is labels of shape (N, )
-    model.eval()
+# Adapted from GRAND: https://github.com/THUDM/GRAND
+def consis_loss(logps, temp=args.tem):
+    ps = [torch.exp(p) for p in logps]
+    sum_p = 0.
+    for p in ps:
+        sum_p = sum_p + p
+    avg_p = sum_p/len(ps)
+    #p2 = torch.exp(logp2)
     
-    if no_conv:
-        out = model(data.x)
-    else:
-        if(is_rgcn):
-            out = model(data.x, data.edge_index, data.edge_type)
+    sharp_p = (torch.pow(avg_p, 1./temp) / torch.sum(torch.pow(avg_p, 1./temp), dim=1, keepdim=True)).detach()
+    loss = 0.
+    for p in ps:
+        loss += torch.mean((p-sharp_p).pow(2).sum(1))
+    loss = loss/len(ps)
+    return args.lam * loss
+
+
+# Load data
+adj, features, idx_train, idx_val, idx_test, labels = load_data(args.dataset)
+
+# Normalize adj and features
+features = features.toarray()
+adj_normalized = normalize_adj(adj + sp.eye(adj.shape[0])) 
+features_normalized = normalize_features(features)
+
+# To PyTorch Tensor
+labels = torch.LongTensor(labels)
+labels = torch.max(labels, dim=1)[1]
+features_normalized = torch.FloatTensor(features_normalized)
+adj_normalized = sparse_mx_to_torch_sparse_tensor(adj_normalized)
+idx_train = torch.LongTensor(idx_train)
+idx_val = torch.LongTensor(idx_val)
+idx_test = torch.LongTensor(idx_test)
+
+cvae_model = torch.load("{}/model/{}.pkl".format(exc_path, args.dataset), map_location=torch.device('cpu'))
+
+def get_augmented_features(concat):
+    X_list = []
+    cvae_features = torch.tensor(features, dtype=torch.float32).to(device)
+    for _ in range(concat):
+        z = torch.randn([cvae_features.size(0), cvae_model.latent_size]).to(device)
+        augmented_features = cvae_model.inference(z, cvae_features)
+        augmented_features = cvae_pretrain.feature_tensor_normalize(augmented_features).detach()
+        if args.cuda:
+            X_list.append(augmented_features.to(device))
         else:
-            out = model(data.x, data.edge_index)
-        
-    y_pred = out.exp()  # (N,num_classes)
-    # print(y_pred)
-    
-    losses, eval_results = dict(), dict()
-    for key in ['train', 'valid', 'test']:
-        node_id = split_idx[key]
-        losses[key] = F.cross_entropy(out[node_id], data.y[node_id]).item()
-        eval_results[key] = evaluator.eval(data.y[node_id], y_pred[node_id])
-            
-    return eval_results, losses, y_pred
+            X_list.append(augmented_features)
+    return X_list
 
 
-def batch_train(epoch, train_loader, model, data, train_idx, optimizer, device, no_conv=False):
-    model.train()
+if args.cuda:
+    adj_normalized = adj_normalized.to(device)
+    labels = labels.to(device)
+    idx_train = idx_train.to(device)
+    idx_val = idx_val.to(device)
+    idx_test = idx_test.to(device)
+    features_normalized = features_normalized.to(device)
 
-    pbar = tqdm(total=train_idx.size(0), ncols=80)
-    pbar.set_description(f'Epoch {epoch:02d}')
+all_val = []
+all_test = []
+for i in trange(args.runs, desc='Run Train'):
 
-    total_loss = total_correct = 0
-    for batch_size, n_id, adjs in train_loader:
-        # `adjs` holds a list of `(edge_index, e_id, size)` tuples.
-        adjs = [adj.to(device) for adj in adjs]
+    # Model and optimizer
+    model = LAGCN(concat=args.concat+1,
+                  nfeat=features.shape[1],
+                  nhid=args.hidden,
+                  nclass=labels.max().item() + 1,
+                  dropout=args.dropout)
+    optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
+    if args.cuda:
+        model.to(device)
+
+    # Train model
+    best = 999999999
+    best_model = None
+    best_X_list = None
+    for epoch in range(args.epochs):
+
+        model.train()
         optimizer.zero_grad()
-        out = model(data.x[n_id], adjs)
-        loss = F.nll_loss(out, data.y[n_id[:batch_size]])
-        loss.backward()
+
+        output_list = []
+        for k in range(args.samples):
+            X_list = get_augmented_features(args.concat)
+            output_list.append(torch.log_softmax(model(X_list+[features_normalized], adj_normalized), dim=-1))
+
+        loss_train = 0.
+        for k in range(len(output_list)):
+            loss_train += F.nll_loss(output_list[k][idx_train], labels[idx_train])
+        
+        loss_train = loss_train/len(output_list)
+
+        loss_consis = consis_loss(output_list)
+        loss_train = loss_train + loss_consis
+
+        loss_train.backward()
         optimizer.step()
 
-        total_loss += float(loss)
-        pbar.update(batch_size)
-
-    pbar.close()
-    loss = total_loss / len(train_loader)
-
-    return loss
-
-
-@torch.no_grad()
-def batch_test(layer_loader, model, data, split_idx, evaluator, device, no_conv=False):
-    # data.y is labels of shape (N, ) 
-    model.eval()
-    
-    out = model.inference(data.x, layer_loader, device)
-#     out = model.inference_all(data)
-    y_pred = out.exp()  # (N,num_classes)   
-    
-    losses, eval_results = dict(), dict()
-    for key in ['train', 'valid', 'test']:
-        node_id = split_idx[key]
-        node_id = node_id.to(device)
-        losses[key] = F.nll_loss(out[node_id], data.y[node_id]).item()
-        eval_results[key] = evaluator.eval(data.y[node_id], y_pred[node_id])[eval_metric]
-            
-    return eval_results, losses, y_pred       
-            
-def main():
-    parser = argparse.ArgumentParser(description='gnn_models')
-    parser.add_argument('--device', type=int, default=0)
-    parser.add_argument('--dataset', type=str, default='Cora')
-    parser.add_argument('--log_steps', type=int, default=10)
-    parser.add_argument('--model', type=str, default='gcn_smart')
-    parser.add_argument('--use_embeddings', action='store_true')
-    parser.add_argument('--epochs', type=int, default=400)
-    parser.add_argument('--runs', type=int, default=1)
-    parser.add_argument('--fold', type=int, default=0)
-    parser.add_argument('--MV_trick', type=str, default='null')
-    parser.add_argument('--BN_trick', type=str, default='null')
-    parser.add_argument('--BN_ratio', type=float, default=0.1)
-    parser.add_argument('--Structure', type=str, default='original')
-    args = parser.parse_args()
-    print(args)
-    
-    no_conv = False
-    if args.model in ['mlp']: no_conv = True        
-    
-    device = f'cuda:{args.device}' if torch.cuda.is_available() else 'cpu'
-    device = torch.device(device)
-   # device = torch.device('cpu')
-    dataset = Planetoid(root='data', name=args.dataset)
-
-    
-    nlabels = dataset.num_classes
+        model.eval()
+        val_X_list = get_augmented_features(args.concat)
+        output = model(val_X_list+[features_normalized], adj_normalized)
+        output = torch.log_softmax(output, dim=1)
+        loss_val = F.nll_loss(output[idx_val], labels[idx_val])
         
-    data = dataset[0]
-    # data.edge_index = data.adj_t
-    # data.adj_t = torch.cat([data.edge_index.coo()[0].view(1,-1),data.edge_index.coo()[1].view(1,-1)],dim=0)
-    # data.edge_index = data.adj_t
-    # structure = Structure(args.Structure)
-    # data = structure.process(data)
-    # data.adj_t = data.edge_index
-    # data.adj_t = tg.utils.to_undirected(data.adj_t)
-    # data.edge_index = data.adj_t
-    
-    # x = data.x
-    # x = (x-x.mean(0))/x.std(0)
-    # data.x = x
-    if data.y.dim()==2:
-        data.y = data.y.squeeze(1)        
-    
-    
-    print(data)
-    
-    
-    # missvalues = Missvalues(args.MV_trick)
-    # data = missvalues.process(data)
-    
-    #print(data.edge_index)
-    
-    # data.edge_index = data.adj_t
-    # BN = Background(args.BN_trick)
-    # data = BN.process(data,args.BN_ratio)
-    
-    split_idx = {'train':data.train_mask, 'valid':data.val_mask, 'test':data.test_mask}
 
-    fold = args.fold
-    if split_idx['train'].dim()>1 and split_idx['train'].shape[1] >1:
-        kfolds = True
-        print('There are {} folds of splits'.format(split_idx['train'].shape[1]))
-        split_idx['train'] = split_idx['train'][:, fold]
-        split_idx['valid'] = split_idx['valid'][:, fold]
-        split_idx['test'] = split_idx['test'][:, fold]
-    else:
-        kfolds = False
-
-    split_idx = {'train':data.train_mask, 'valid':data.val_mask, 'test':data.test_mask}
-
-    data = data.to(device)
-    train_idx = split_idx['train'].to(device)
-        
-    result_dir = prepare_folder(args.dataset, args.model)
-    print('result_dir:', result_dir)
-    
-    is_rgcn=False
-    if args.model == 'mlp':
-        para_dict = mlp_parameters
-        model_para = mlp_parameters.copy()
-        model_para.pop('lr')
-        model_para.pop('l2')
-        model = MLP(in_channels = data.x.size(-1), out_channels = nlabels, **model_para).to(device)
-    if args.model == 'gcn':   
-        para_dict = gcn_parameters
-        model_para = gcn_parameters.copy()
-        model_para.pop('lr')
-        model_para.pop('l2')        
-        model = GCN(in_channels = data.x.size(-1), out_channels = nlabels, **model_para).to(device)
-    if args.model == 'sage':        
-        para_dict = sage_parameters
-        model_para = sage_parameters.copy()
-        model_para.pop('lr')
-        model_para.pop('l2')        
-        model = SAGE(in_channels = data.x.size(-1), out_channels = nlabels, **model_para).to(device)
-    if args.model == 'rgcn':   
-        para_dict = gcn_parameters
-        model = RGCN(data.x.size(-1),16,2,4).to(device)
-        is_rgcn=True
-    if args.model == 'gat_neighsampler':   
-        para_dict = gat_neighsampler_parameters
-        model_para = gat_neighsampler_parameters.copy()
-        model_para.pop('lr')
-        model_para.pop('l2')        
-        model = GAT_NeighSampler(in_channels = data.x.size(-1), out_channels = nlabels, **model_para).to(device)   
-    if args.model == 'gcn_smart':
-        para_dict = gcn_smart_parameters
-        model_para = gcn_smart_parameters.copy()
-        model_para.pop('lr')
-        model_para.pop('l2')  
-        model = SMART(data.x.size(-1), hidden_dim = 64, output_dim = nlabels, dropout=0, similarity_threshold=0.5, num_layers=2).to(device)
-    print(f'Model {args.model} initialized')
-
-    evaluator = Evaluator(eval_metric)
-    logger = Logger(args.runs, args)
-    # weight = torch.tensor([1,50]).to(device).float()
-   
-    for run in range(args.runs):
-        import gc
-        gc.collect()
-        print(sum(p.numel() for p in model.parameters()))
-
-        # model.reset_parameters()
-        optimizer = torch.optim.Adam(model.parameters(), lr=para_dict['lr'], weight_decay=para_dict['l2'])
-        best_valid = 0
-        min_valid_loss = 1e8
-        best_out = None
-        
-        time_ls = []
-        starttime = time.time()
-        for epoch in range(1, args.epochs+1):
-            starttime = time.time()
-            loss = batch_train(model, data, train_idx, optimizer, no_conv,is_rgcn)
-            
-            endtime = time.time()
-            time_ls.append(endtime-starttime)
-            eval_results, losses, out = batch_test(model, data, split_idx, evaluator,no_conv,is_rgcn)
-            train_auc, valid_auc, test_auc = eval_results['train']['auc'], eval_results['valid']['auc'], eval_results['test']['auc']
-            train_ap, valid_ap, test_ap = eval_results['train']['ap'], eval_results['valid']['ap'], eval_results['test']['ap']
-                                                                                                 
-            train_loss, valid_loss, test_loss = losses['train'], losses['valid'], losses['test']
-            #print(eval_results['train'])
-#                 if valid_eval > best_valid:
-#                     best_valid = valid_result
-#                     best_out = out.cpu().exp()
-            
-            if valid_loss < min_valid_loss:
-                min_valid_loss = valid_loss
-                best_out = out.cpu()
-            
-            
-            if epoch % args.log_steps == 0:
-                print(f'Run: {run + 1:02d}, '
-                          f'Epoch: {epoch:02d}, '
-                          f'Loss: {loss:.4f}, '
-                          f'Train AUC: {train_auc:.3f} '
-                          f'Train AP: {train_ap:.3f} '
-                          f'Valid AUC: {valid_auc:.3f} '
-                          f'Valid AP: {valid_ap:.3f} '
-                          f'Test AUC: { test_auc:.3f} '
-                          f'Test AP: { test_ap:.3f} '
-                          f'Train time(s): {np.mean(time_ls):.3f}')
+        print('Epoch: {:04d}'.format(epoch+1),
+              'loss_train: {:.4f}'.format(loss_train.item()),
+              'loss_val: {:.4f}'.format(loss_val.item()))
                 
-                
-                time_ls = []
-            logger.add_result(run, [train_auc, valid_auc, test_auc])
+        if loss_val < best:
+            best = loss_val
+            best_model = copy.deepcopy(model)
+            best_X_list = copy.deepcopy(val_X_list)
 
-        logger.print_statistics(run)
+    #Validate and Test
+    best_model.eval()
+    output = best_model(best_X_list+[features_normalized], adj_normalized)
+    output = torch.log_softmax(output, dim=1)
+    acc_val = accuracy(output[idx_val], labels[idx_val])
+    acc_test = accuracy(output[idx_test], labels[idx_test])
 
-    final_results = logger.print_statistics()
-    print('final_results:', final_results)
-    para_dict.update(final_results)
-    pd.DataFrame(para_dict, index=[args.model]).to_csv(result_dir+'/cora_gat_results.csv')
+    all_val.append(acc_val.item())
+    all_test.append(acc_test.item())
 
+print(np.mean(all_val), np.std(all_val), np.mean(all_test), np.std(all_test))
 
-if __name__ == "__main__":
-    main()

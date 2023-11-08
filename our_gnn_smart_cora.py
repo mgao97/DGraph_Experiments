@@ -13,6 +13,10 @@ from torch_geometric.data import NeighborSampler
 from tqdm import tqdm
 import argparse
 
+from scipy.sparse import coo_matrix
+
+from utils.utils import load_data
+
 import torch
 import torch.nn.functional as F
 import torch.nn as nn
@@ -180,27 +184,29 @@ def main():
     device = f'cuda:{args.device}' if torch.cuda.is_available() else 'cpu'
     device = torch.device(device)
    # device = torch.device('cpu')
-    dataset = Planetoid(root='data', name=args.dataset)
+    dataset = Planetoid(root='data', name=args.dataset, transform=T.NormalizeFeatures())
 
     
     nlabels = dataset.num_classes
         
     data = dataset[0]
     # data.edge_index = data.adj_t
-    data.adj_t = torch.cat([data.edge_index.coo()[0].view(1,-1),data.edge_index.coo()[1].view(1,-1)],dim=0)
-    data.edge_index = data.adj_t
+    # data.adj_t = torch.cat([data.edge_index.coo()[0].view(1,-1),data.edge_index.coo()[1].view(1,-1)],dim=0)
+    # data.edge_index = data.adj_t
     # structure = Structure(args.Structure)
     # data = structure.process(data)
     # data.adj_t = data.edge_index
-    data.adj_t = tg.utils.to_undirected(data.adj_t)
-    data.edge_index = data.adj_t
+    # data.adj_t = tg.utils.to_undirected(data.adj_t)
+    # data.edge_index = data.adj_t
+    
+    adj, features, idx_train, idx_val, idx_test, labels = load_data('cora')
+    data.adj = adj
     
     # x = data.x
     # x = (x-x.mean(0))/x.std(0)
     # data.x = x
     if data.y.dim()==2:
         data.y = data.y.squeeze(1)        
-    
     
     print(data)
     
